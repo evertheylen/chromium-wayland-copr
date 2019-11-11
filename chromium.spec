@@ -1178,6 +1178,7 @@ build/linux/unbundle/remove_bundled_libraries.py \
         'third_party/usb_ids' \
 	'third_party/usrsctp' \
 	'third_party/vulkan' \
+	'third_party/wayland' \
 	'third_party/web-animations-js' \
 	'third_party/webdriver' \
 	'third_party/webrtc' \

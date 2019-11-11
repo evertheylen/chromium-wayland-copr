@@ -1115,8 +1115,6 @@ build/linux/unbundle/remove_bundled_libraries.py \
 %endif
 	'third_party/mesa' \
 	'third_party/metrics_proto' \
-# wayland
-	'third_party/minigbm' \
 	'third_party/modp_b64' \
 	'third_party/nasm' \
 	'third_party/node' \

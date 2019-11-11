@@ -276,7 +276,7 @@ Patch300:	chromium-76.0.3809.132-rhel8-force-disable-use_gnome_keyring.patch
 # Ozone patches
 Patch400: fixvaapi.patch
 Patch401: 0001-ozone-wayland-Implement-CreateNativePixmapAsync.patch
-Patch402: wl_buffer.patch
+#Patch402: wl_buffer.patch
 
 # Use chromium-latest.py to generate clean tarball from released build tarballs, found here:
 # http://build.chromium.org/buildbot/official/

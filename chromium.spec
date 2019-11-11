@@ -273,6 +273,11 @@ Patch205:	chromium-76.0.3809.100-pulse-api-change.patch
 # Apply these patches to work around EPEL8 issues
 Patch300:	chromium-76.0.3809.132-rhel8-force-disable-use_gnome_keyring.patch
 
+# Ozone patches
+Patch400: fixvaapi.patch
+Patch401: 0001-ozone-wayland-Implement-CreateNativePixmapAsync.patch
+Patch402: wl_buffer.patch
+
 # Use chromium-latest.py to generate clean tarball from released build tarballs, found here:
 # http://build.chromium.org/buildbot/official/
 # For Chromium Fedora use chromium-latest.py --stable --ffmpegclean --ffmpegarm
@@ -524,6 +529,14 @@ BuildRequires:	java-1.8.0-openjdk-headless
 %if 0%{?rhel} == 7
 BuildRequires: devtoolset-%{dts_version}-toolchain, devtoolset-%{dts_version}-libatomic-devel
 %endif
+
+# Wayland stuff
+BuildRequires:  pkgconfig(gbm)
+BuildRequires:  pkgconfig(wayland-client)
+BuildRequires:  pkgconfig(wayland-cursor)
+BuildRequires:  pkgconfig(wayland-scanner)
+BuildRequires:  pkgconfig(wayland-server)
+
 
 # There is a hardcoded check for nss 3.26 in the chromium code (crypto/nss_util.cc)
 Requires:	nss%{_isa} >= 3.26
@@ -1102,6 +1115,8 @@ build/linux/unbundle/remove_bundled_libraries.py \
 %endif
 	'third_party/mesa' \
 	'third_party/metrics_proto' \
+# wayland
+	'third_party/minigbm' \
 	'third_party/modp_b64' \
 	'third_party/nasm' \
 	'third_party/node' \

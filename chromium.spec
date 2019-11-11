@@ -902,6 +902,10 @@ popd
 # Core defines are flags that are true for both the browser and headless.
 CHROMIUM_CORE_GN_DEFINES=""
 CHROMIUM_CORE_GN_DEFINES+=' is_debug=false'
+
+# Wayland settings
+CHROMIUM_CORE_GN_DEFINES+=' use_ozone=true use_system_minigbm=true use_system_libdrm=true use_xkbcommon=true'
+
 %ifarch x86_64 aarch64
 CHROMIUM_CORE_GN_DEFINES+=' system_libdir="lib64"'
 %endif

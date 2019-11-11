@@ -1,0 +1,868 @@
+From 3f7171ec78cb42b5c7a5088ace74d34c8f5d8851 Mon Sep 17 00:00:00 2001
+From: Maksim Sisov <msisov@igalia.com>
+Date: Thu, 26 Sep 2019 14:03:26 +0300
+Subject: [PATCH] [ozone/wayland]: Add wl_drm support.
+
+At the moment, we have zwp_linux_dmabuf support that we use
+to create wl_buffers in the browser process based on passed dmabuf prime fds
+from the GPU process.
+
+However, there are plenty of systems that also support
+EGL_EXT_image_dma_buf_import, but do not provide zwp_linux_dmabuf
+protocol extension.
+
+Instead, they use wl_drm protocol implemented by use. Thus,
+import it to third_party protocols and utilize it in the
+Ozone/Wayland implementation.
+
+There are no functionality changes brought with this CL, but rather
+it adds support for that protocol and uses it if zwp_linux_dmabuf
+is not available.
+
+If non of them is available, Chromium uses software compositing
+(viz process spawned) or Wayland Egl (in-process-gpu mode).
+
+Bug: 1008348
+Change-Id: I06eddc68ef0ad0a897aeefa1f31677986e563eac
+---
+ third_party/wayland-protocols/BUILD.gn        |   6 +
+ .../wayland-protocols/mesa/wayland-drm/README |   4 +
+ .../mesa/wayland-drm/wayland-drm.xml          | 189 ++++++++++++++++++
+ ui/ozone/platform/wayland/BUILD.gn            |   3 +
+ .../platform/wayland/common/wayland_object.cc |   4 +
+ .../platform/wayland/common/wayland_object.h  |   7 +
+ .../platform/wayland/common/wayland_util.h    |   7 +
+ .../host/wayland_buffer_manager_connector.cc  |  15 +-
+ .../host/wayland_buffer_manager_connector.h   |   6 +-
+ .../host/wayland_buffer_manager_host.cc       |  22 +-
+ .../host/wayland_buffer_manager_host.h        |   4 +-
+ .../wayland/host/wayland_connection.cc        |   7 +
+ .../wayland/host/wayland_connection.h         |   4 +
+ ui/ozone/platform/wayland/host/wayland_drm.cc | 152 ++++++++++++++
+ ui/ozone/platform/wayland/host/wayland_drm.h  | 101 ++++++++++
+ .../wayland/host/wayland_zwp_linux_dmabuf.h   |   2 +-
+ .../wayland/ozone_platform_wayland.cc         |   1 +
+ 17 files changed, 515 insertions(+), 19 deletions(-)
+ create mode 100644 third_party/wayland-protocols/mesa/wayland-drm/README
+ create mode 100644 third_party/wayland-protocols/mesa/wayland-drm/wayland-drm.xml
+ create mode 100644 ui/ozone/platform/wayland/host/wayland_drm.cc
+ create mode 100644 ui/ozone/platform/wayland/host/wayland_drm.h
+
+diff --git a/third_party/wayland-protocols/BUILD.gn b/third_party/wayland-protocols/BUILD.gn
+index 8a204e5276e7..f9c41139a52b 100644
+--- a/third_party/wayland-protocols/BUILD.gn
++++ b/third_party/wayland-protocols/BUILD.gn
+@@ -130,3 +130,9 @@ wayland_protocol("linux_explicit_synchronization_protocol") {
+     "src/unstable/linux-explicit-synchronization/linux-explicit-synchronization-unstable-v1.xml",
+   ]
+ }
++
++wayland_protocol("wayland_drm_protocol") {
++  sources = [
++    "mesa/wayland-drm/wayland-drm.xml",
++  ]
++}
+diff --git a/third_party/wayland-protocols/mesa/wayland-drm/README b/third_party/wayland-protocols/mesa/wayland-drm/README
+new file mode 100644
+index 000000000000..03283e4ec633
+--- /dev/null
++++ b/third_party/wayland-protocols/mesa/wayland-drm/README
+@@ -0,0 +1,4 @@
++Wayland DRM protocol
++
++Maintainers:
++Maksim Sisov <msisov@igalia.com>
+diff --git a/third_party/wayland-protocols/mesa/wayland-drm/wayland-drm.xml b/third_party/wayland-protocols/mesa/wayland-drm/wayland-drm.xml
+new file mode 100644
+index 000000000000..eaf2654ab266
+--- /dev/null
++++ b/third_party/wayland-protocols/mesa/wayland-drm/wayland-drm.xml
+@@ -0,0 +1,189 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="drm">
++
++  <copyright>
++    Copyright © 2008-2011 Kristian Høgsberg
++    Copyright © 2010-2011 Intel Corporation
++
++    Permission to use, copy, modify, distribute, and sell this
++    software and its documentation for any purpose is hereby granted
++    without fee, provided that\n the above copyright notice appear in
++    all copies and that both that copyright notice and this permission
++    notice appear in supporting documentation, and that the name of
++    the copyright holders not be used in advertising or publicity
++    pertaining to distribution of the software without specific,
++    written prior permission.  The copyright holders make no
++    representations about the suitability of this software for any
++    purpose.  It is provided "as is" without express or implied
++    warranty.
++
++    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++    AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
++    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
++    THIS SOFTWARE.
++  </copyright>
++
++  <!-- drm support. This object is created by the server and published
++       using the display's global event. -->
++  <interface name="wl_drm" version="2">
++    <enum name="error">
++      <entry name="authenticate_fail" value="0"/>
++      <entry name="invalid_format" value="1"/>
++      <entry name="invalid_name" value="2"/>
++    </enum>
++
++    <enum name="format">
++      <!-- The drm format codes match the #defines in drm_fourcc.h.
++           The formats actually supported by the compositor will be
++           reported by the format event. New codes must not be added,
++           unless directly taken from drm_fourcc.h. -->
++      <entry name="c8" value="0x20203843"/>
++      <entry name="rgb332" value="0x38424752"/>
++      <entry name="bgr233" value="0x38524742"/>
++      <entry name="xrgb4444" value="0x32315258"/>
++      <entry name="xbgr4444" value="0x32314258"/>
++      <entry name="rgbx4444" value="0x32315852"/>
++      <entry name="bgrx4444" value="0x32315842"/>
++      <entry name="argb4444" value="0x32315241"/>
++      <entry name="abgr4444" value="0x32314241"/>
++      <entry name="rgba4444" value="0x32314152"/>
++      <entry name="bgra4444" value="0x32314142"/>
++      <entry name="xrgb1555" value="0x35315258"/>
++      <entry name="xbgr1555" value="0x35314258"/>
++      <entry name="rgbx5551" value="0x35315852"/>
++      <entry name="bgrx5551" value="0x35315842"/>
++      <entry name="argb1555" value="0x35315241"/>
++      <entry name="abgr1555" value="0x35314241"/>
++      <entry name="rgba5551" value="0x35314152"/>
++      <entry name="bgra5551" value="0x35314142"/>
++      <entry name="rgb565" value="0x36314752"/>
++      <entry name="bgr565" value="0x36314742"/>
++      <entry name="rgb888" value="0x34324752"/>
++      <entry name="bgr888" value="0x34324742"/>
++      <entry name="xrgb8888" value="0x34325258"/>
++      <entry name="xbgr8888" value="0x34324258"/>
++      <entry name="rgbx8888" value="0x34325852"/>
++      <entry name="bgrx8888" value="0x34325842"/>
++      <entry name="argb8888" value="0x34325241"/>
++      <entry name="abgr8888" value="0x34324241"/>
++      <entry name="rgba8888" value="0x34324152"/>
++      <entry name="bgra8888" value="0x34324142"/>
++      <entry name="xrgb2101010" value="0x30335258"/>
++      <entry name="xbgr2101010" value="0x30334258"/>
++      <entry name="rgbx1010102" value="0x30335852"/>
++      <entry name="bgrx1010102" value="0x30335842"/>
++      <entry name="argb2101010" value="0x30335241"/>
++      <entry name="abgr2101010" value="0x30334241"/>
++      <entry name="rgba1010102" value="0x30334152"/>
++      <entry name="bgra1010102" value="0x30334142"/>
++      <entry name="yuyv" value="0x56595559"/>
++      <entry name="yvyu" value="0x55595659"/>
++      <entry name="uyvy" value="0x59565955"/>
++      <entry name="vyuy" value="0x59555956"/>
++      <entry name="ayuv" value="0x56555941"/>
++      <entry name="xyuv8888" value="0x56555958"/>
++      <entry name="nv12" value="0x3231564e"/>
++      <entry name="nv21" value="0x3132564e"/>
++      <entry name="nv16" value="0x3631564e"/>
++      <entry name="nv61" value="0x3136564e"/>
++      <entry name="yuv410" value="0x39565559"/>
++      <entry name="yvu410" value="0x39555659"/>
++      <entry name="yuv411" value="0x31315559"/>
++      <entry name="yvu411" value="0x31315659"/>
++      <entry name="yuv420" value="0x32315559"/>
++      <entry name="yvu420" value="0x32315659"/>
++      <entry name="yuv422" value="0x36315559"/>
++      <entry name="yvu422" value="0x36315659"/>
++      <entry name="yuv444" value="0x34325559"/>
++      <entry name="yvu444" value="0x34325659"/>
++      <entry name="abgr16f" value="0x48344241"/>
++      <entry name="xbgr16f" value="0x48344258"/>
++    </enum>
++
++    <!-- Call this request with the magic received from drmGetMagic().
++         It will be passed on to the drmAuthMagic() or
++         DRIAuthConnection() call.  This authentication must be
++         completed before create_buffer could be used. -->
++    <request name="authenticate">
++      <arg name="id" type="uint"/>
++    </request>
++
++    <!-- Create a wayland buffer for the named DRM buffer.  The DRM
++         surface must have a name using the flink ioctl -->
++    <request name="create_buffer">
++      <arg name="id" type="new_id" interface="wl_buffer"/>
++      <arg name="name" type="uint"/>
++      <arg name="width" type="int"/>
++      <arg name="height" type="int"/>
++      <arg name="stride" type="uint"/>
++      <arg name="format" type="uint"/>
++    </request>
++
++    <!-- Create a wayland buffer for the named DRM buffer.  The DRM
++         surface must have a name using the flink ioctl -->
++    <request name="create_planar_buffer">
++      <arg name="id" type="new_id" interface="wl_buffer"/>
++      <arg name="name" type="uint"/>
++      <arg name="width" type="int"/>
++      <arg name="height" type="int"/>
++      <arg name="format" type="uint"/>
++      <arg name="offset0" type="int"/>
++      <arg name="stride0" type="int"/>
++      <arg name="offset1" type="int"/>
++      <arg name="stride1" type="int"/>
++      <arg name="offset2" type="int"/>
++      <arg name="stride2" type="int"/>
++    </request>
++
++    <!-- Notification of the path of the drm device which is used by
++         the server.  The client should use this device for creating
++         local buffers.  Only buffers created from this device should
++         be be passed to the server using this drm object's
++         create_buffer request. -->
++    <event name="device">
++      <arg name="name" type="string"/>
++    </event>
++
++    <event name="format">
++      <arg name="format" type="uint"/>
++    </event>
++
++    <!-- Raised if the authenticate request succeeded -->
++    <event name="authenticated"/>
++
++    <enum name="capability" since="2">
++      <description summary="wl_drm capability bitmask">
++        Bitmask of capabilities.
++      </description>
++      <entry name="prime" value="1" summary="wl_drm prime available"/>
++    </enum>
++
++    <event name="capabilities">
++      <arg name="value" type="uint"/>
++    </event>
++
++    <!-- Version 2 additions -->
++
++    <!-- Create a wayland buffer for the prime fd.  Use for regular and planar
++         buffers.  Pass 0 for offset and stride for unused planes. -->
++    <request name="create_prime_buffer" since="2">
++      <arg name="id" type="new_id" interface="wl_buffer"/>
++      <arg name="name" type="fd"/>
++      <arg name="width" type="int"/>
++      <arg name="height" type="int"/>
++      <arg name="format" type="uint"/>
++      <arg name="offset0" type="int"/>
++      <arg name="stride0" type="int"/>
++      <arg name="offset1" type="int"/>
++      <arg name="stride1" type="int"/>
++      <arg name="offset2" type="int"/>
++      <arg name="stride2" type="int"/>
++    </request>
++
++  </interface>
++
++</protocol>
+diff --git a/ui/ozone/platform/wayland/BUILD.gn b/ui/ozone/platform/wayland/BUILD.gn
+index 91f497052fae..199436addf2a 100644
+--- a/ui/ozone/platform/wayland/BUILD.gn
++++ b/ui/ozone/platform/wayland/BUILD.gn
+@@ -51,6 +51,8 @@ source_set("wayland") {
+     "host/wayland_data_offer.h",
+     "host/wayland_data_source.cc",
+     "host/wayland_data_source.h",
++    "host/wayland_drm.cc",
++    "host/wayland_drm.h",
+     "host/wayland_input_method_context.cc",
+     "host/wayland_input_method_context.h",
+     "host/wayland_input_method_context_factory.cc",
+@@ -108,6 +110,7 @@ source_set("wayland") {
+     "//third_party/wayland-protocols:linux_dmabuf_protocol",
+     "//third_party/wayland-protocols:presentation_time_protocol",
+     "//third_party/wayland-protocols:text_input_protocol",
++    "//third_party/wayland-protocols:wayland_drm_protocol",
+     "//third_party/wayland-protocols:xdg_shell_protocol",
+     "//ui/base",
+     "//ui/base:buildflags",
+diff --git a/ui/ozone/platform/wayland/common/wayland_object.cc b/ui/ozone/platform/wayland/common/wayland_object.cc
+index afb78c837249..683b2d8557fe 100644
+--- a/ui/ozone/platform/wayland/common/wayland_object.cc
++++ b/ui/ozone/platform/wayland/common/wayland_object.cc
+@@ -8,6 +8,7 @@
+ #include <presentation-time-client-protocol.h>
+ #include <text-input-unstable-v1-client-protocol.h>
+ #include <wayland-client.h>
++#include <wayland-drm-client-protocol.h>
+ #include <xdg-shell-unstable-v5-client-protocol.h>
+ #include <xdg-shell-unstable-v6-client-protocol.h>
+ 
+@@ -85,6 +86,9 @@ const wl_interface* ObjectTraits<wl_data_source>::interface =
+ void (*ObjectTraits<wl_data_source>::deleter)(wl_data_source*) =
+     &wl_data_source_destroy;
+ 
++const wl_interface* ObjectTraits<wl_drm>::interface = &wl_drm_interface;
++void (*ObjectTraits<wl_drm>::deleter)(wl_drm*) = &wl_drm_destroy;
++
+ const wl_interface* ObjectTraits<wl_display>::interface = &wl_display_interface;
+ void (*ObjectTraits<wl_display>::deleter)(wl_display*) = &wl_display_disconnect;
+ 
+diff --git a/ui/ozone/platform/wayland/common/wayland_object.h b/ui/ozone/platform/wayland/common/wayland_object.h
+index 367e1c581e48..3d2d9156d682 100644
+--- a/ui/ozone/platform/wayland/common/wayland_object.h
++++ b/ui/ozone/platform/wayland/common/wayland_object.h
+@@ -15,6 +15,7 @@ struct wl_data_device_manager;
+ struct wl_data_device;
+ struct wl_data_offer;
+ struct wl_data_source;
++struct wl_drm;
+ struct wl_keyboard;
+ struct wl_output;
+ struct wl_pointer;
+@@ -88,6 +89,12 @@ struct ObjectTraits<wl_data_source> {
+   static void (*deleter)(wl_data_source*);
+ };
+ 
++template <>
++struct ObjectTraits<wl_drm> {
++  static const wl_interface* interface;
++  static void (*deleter)(wl_drm*);
++};
++
+ template <>
+ struct ObjectTraits<wl_display> {
+   static const wl_interface* interface;
+diff --git a/ui/ozone/platform/wayland/common/wayland_util.h b/ui/ozone/platform/wayland/common/wayland_util.h
+index 739229f563aa..7f34b4ef828b 100644
+--- a/ui/ozone/platform/wayland/common/wayland_util.h
++++ b/ui/ozone/platform/wayland/common/wayland_util.h
+@@ -7,7 +7,10 @@
+ 
+ #include <wayland-client.h>
+ 
++#include <vector>
++
+ #include "base/callback.h"
++#include "base/containers/flat_map.h"
+ #include "base/macros.h"
+ #include "ui/ozone/platform/wayland/common/wayland_object.h"
+ 
+@@ -19,6 +22,7 @@ class WaylandShmBuffer;
+ }  // namespace ui
+ 
+ namespace gfx {
++enum class BufferFormat;
+ class Size;
+ }  // namespace gfx
+ 
+@@ -29,6 +33,9 @@ using RequestSizeCallback = base::OnceCallback<void(const gfx::Size&)>;
+ using OnRequestBufferCallback =
+     base::OnceCallback<void(wl::Object<struct wl_buffer>)>;
+ 
++using BufferFormatsWithModifiersMap =
++    base::flat_map<gfx::BufferFormat, std::vector<uint64_t>>;
++
+ // Identifies the direction of the "hittest" for Wayland. |connection|
+ // is used to identify whether values from shell v5 or v6 must be used.
+ uint32_t IdentifyDirection(const ui::WaylandConnection& connection,
+diff --git a/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.cc b/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.cc
+index 409adc52b3c8..a3b35aa53ff7 100644
+--- a/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.cc
++++ b/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.cc
+@@ -7,6 +7,7 @@
+ #include "base/bind.h"
+ #include "base/task_runner_util.h"
+ #include "ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h"
++#include "ui/ozone/platform/wayland/host/wayland_connection.h"
+ 
+ namespace ui {
+ 
+@@ -32,8 +33,8 @@ void BindInterfaceInGpuProcess(mojo::InterfaceRequest<Interface> request,
+ }  // namespace
+ 
+ WaylandBufferManagerConnector::WaylandBufferManagerConnector(
+-    WaylandBufferManagerHost* buffer_manager)
+-    : buffer_manager_(buffer_manager) {}
++    WaylandBufferManagerHost* buffer_manager_host)
++    : buffer_manager_host_(buffer_manager_host) {}
+ 
+ WaylandBufferManagerConnector::~WaylandBufferManagerConnector() = default;
+ 
+@@ -44,7 +45,7 @@ void WaylandBufferManagerConnector::OnGpuProcessLaunched(
+     base::RepeatingCallback<void(IPC::Message*)> send_callback) {}
+ 
+ void WaylandBufferManagerConnector::OnChannelDestroyed(int host_id) {
+-  buffer_manager_->OnChannelDestroyed();
++  buffer_manager_host_->OnChannelDestroyed();
+ }
+ 
+ void WaylandBufferManagerConnector::OnMessageReceived(
+@@ -66,12 +67,12 @@ void WaylandBufferManagerConnector::OnGpuServiceLaunched(
+   auto on_terminate_gpu_cb =
+       base::BindOnce(&WaylandBufferManagerConnector::OnTerminateGpuProcess,
+                      base::Unretained(this));
+-  buffer_manager_->SetTerminateGpuCallback(std::move(on_terminate_gpu_cb));
++  buffer_manager_host_->SetTerminateGpuCallback(std::move(on_terminate_gpu_cb));
+ 
+   base::PostTaskAndReplyWithResult(
+       ui_runner.get(), FROM_HERE,
+       base::BindOnce(&WaylandBufferManagerHost::BindInterface,
+-                     base::Unretained(buffer_manager_)),
++                     base::Unretained(buffer_manager_host_)),
+       base::BindOnce(
+           &WaylandBufferManagerConnector::OnBufferManagerHostPtrBinded,
+           base::Unretained(this)));
+@@ -87,8 +88,8 @@ void WaylandBufferManagerConnector::OnBufferManagerHostPtrBinded(
+       std::move(buffer_manager_host_ptr));
+ 
+ #if defined(WAYLAND_GBM)
+-  if (!buffer_manager_->CanCreateDmabufBasedBuffer()) {
+-    LOG(WARNING) << "zwp_linux_dmabuf is not available.";
++  if (!buffer_manager_host_->SupportsDmabuf()) {
++    LOG(WARNING) << "dmabuf support is not available.";
+     buffer_manager_gpu_ptr->ResetGbmDevice();
+   }
+ #endif
+diff --git a/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.h b/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.h
+index d63b43d8be5c..010dc8e05e34 100644
+--- a/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.h
++++ b/ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.h
+@@ -19,7 +19,7 @@ class WaylandBufferManagerHost;
+ class WaylandBufferManagerConnector : public GpuPlatformSupportHost {
+  public:
+   explicit WaylandBufferManagerConnector(
+-      WaylandBufferManagerHost* buffer_manager);
++      WaylandBufferManagerHost* buffer_manager_host);
+   ~WaylandBufferManagerConnector() override;
+ 
+   // GpuPlatformSupportHost:
+@@ -43,9 +43,9 @@ class WaylandBufferManagerConnector : public GpuPlatformSupportHost {
+ 
+   void OnTerminateGpuProcess(std::string message);
+ 
+-  // Non-owning pointer, which is used to bind a mojo pointer to the
++  // Non-owned pointer, which is used to bind a mojo pointer to the
+   // WaylandBufferManagerHost.
+-  WaylandBufferManagerHost* const buffer_manager_;
++  WaylandBufferManagerHost* const buffer_manager_host_;
+ 
+   GpuHostBindInterfaceCallback binder_;
+   GpuHostTerminateCallback terminate_callback_;
+diff --git a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
+index 3f163a012c31..4e99d6bab857 100644
+--- a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
++++ b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.cc
+@@ -14,6 +14,7 @@
+ #include "mojo/public/cpp/system/platform_handle.h"
+ #include "ui/ozone/common/linux/drm_util_linux.h"
+ #include "ui/ozone/platform/wayland/host/wayland_connection.h"
++#include "ui/ozone/platform/wayland/host/wayland_drm.h"
+ #include "ui/ozone/platform/wayland/host/wayland_shm.h"
+ #include "ui/ozone/platform/wayland/host/wayland_window.h"
+ #include "ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h"
+@@ -508,8 +509,9 @@ void WaylandBufferManagerHost::OnChannelDestroyed() {
+     surface_pair.second->ClearState();
+ }
+ 
+-bool WaylandBufferManagerHost::CanCreateDmabufBasedBuffer() const {
+-  return !!connection_->zwp_dmabuf();
++bool WaylandBufferManagerHost::SupportsDmabuf() const {
++  return !!connection_->zwp_dmabuf() ||
++         (connection_->drm() && connection_->drm()->SupportsDrmPrime());
+ }
+ 
+ void WaylandBufferManagerHost::SetWaylandBufferManagerGpuPtr(
+@@ -550,9 +552,19 @@ void WaylandBufferManagerHost::CreateDmabufBasedBuffer(
+   auto callback =
+       base::BindOnce(&WaylandBufferManagerHost::OnCreateBufferComplete,
+                      weak_factory_.GetWeakPtr(), widget, buffer_id);
+-  connection_->zwp_dmabuf()->CreateBuffer(std::move(fd), size, strides, offsets,
+-                                          modifiers, format, planes_count,
+-                                          std::move(callback));
++  if (connection_->zwp_dmabuf()) {
++    connection_->zwp_dmabuf()->CreateBuffer(std::move(fd), size, strides,
++                                            offsets, modifiers, format,
++                                            planes_count, std::move(callback));
++  } else if (connection_->drm()) {
++    connection_->drm()->CreateBuffer(std::move(fd), size, strides, offsets,
++                                     modifiers, format, planes_count,
++                                     std::move(callback));
++  } else {
++    // This method must never be called if neither zwp_linux_dmabuf or wl_drm
++    // are supported.
++    NOTREACHED();
++  }
+ }
+ 
+ void WaylandBufferManagerHost::CreateShmBasedBuffer(
+diff --git a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h
+index 63fa02b4089d..7fb89e18491f 100644
+--- a/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h
++++ b/ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h
+@@ -51,9 +51,7 @@ class WaylandBufferManagerHost : ozone::mojom::WaylandBufferManagerHost {
+   // destroyed.
+   void OnChannelDestroyed();
+ 
+-  // Says if zwp_linux_dmabuf interface is available, and the manager is able to
+-  // create dmabuf based buffers.
+-  bool CanCreateDmabufBasedBuffer() const;
++  bool SupportsDmabuf() const;
+ 
+   // ozone::mojom::WaylandBufferManagerHost overrides:
+   //
+diff --git a/ui/ozone/platform/wayland/host/wayland_connection.cc b/ui/ozone/platform/wayland/host/wayland_connection.cc
+index a949baf5a934..926f15fde21e 100644
+--- a/ui/ozone/platform/wayland/host/wayland_connection.cc
++++ b/ui/ozone/platform/wayland/host/wayland_connection.cc
+@@ -23,6 +23,7 @@
+ #include "ui/gfx/swap_result.h"
+ #include "ui/ozone/platform/wayland/common/wayland_object.h"
+ #include "ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h"
++#include "ui/ozone/platform/wayland/host/wayland_drm.h"
+ #include "ui/ozone/platform/wayland/host/wayland_input_method_context.h"
+ #include "ui/ozone/platform/wayland/host/wayland_output_manager.h"
+ #include "ui/ozone/platform/wayland/host/wayland_shm.h"
+@@ -42,6 +43,7 @@ constexpr uint32_t kMaxXdgShellVersion = 1;
+ constexpr uint32_t kMaxDeviceManagerVersion = 3;
+ constexpr uint32_t kMaxWpPresentationVersion = 1;
+ constexpr uint32_t kMaxTextInputManagerVersion = 1;
++constexpr uint32_t kMinWlDrmVersion = 2;
+ constexpr uint32_t kMinWlOutputVersion = 2;
+ }  // namespace
+ 
+@@ -394,6 +396,11 @@ void WaylandConnection::Global(void* data,
+       LOG(ERROR) << "Failed to bind to zwp_text_input_manager_v1 global";
+       return;
+     }
++  } else if (!connection->drm_ && (strcmp(interface, "wl_drm") == 0) &&
++             version >= kMinWlDrmVersion) {
++    auto wayland_drm = wl::Bind<struct wl_drm>(registry, name, version);
++    connection->drm_ =
++        std::make_unique<WaylandDrm>(wayland_drm.release(), connection);
+   }
+ 
+   connection->ScheduleFlush();
+diff --git a/ui/ozone/platform/wayland/host/wayland_connection.h b/ui/ozone/platform/wayland/host/wayland_connection.h
+index 9ae6527337c6..7fdda4f1e8bd 100644
+--- a/ui/ozone/platform/wayland/host/wayland_connection.h
++++ b/ui/ozone/platform/wayland/host/wayland_connection.h
+@@ -31,6 +31,7 @@ namespace ui {
+ class WaylandBufferManagerHost;
+ class WaylandOutputManager;
+ class WaylandWindow;
++class WaylandDrm;
+ class WaylandZwpLinuxDmabuf;
+ class WaylandShm;
+ 
+@@ -100,6 +101,8 @@ class WaylandConnection : public PlatformEventSource,
+ 
+   WaylandZwpLinuxDmabuf* zwp_dmabuf() const { return zwp_dmabuf_.get(); }
+ 
++  WaylandDrm* drm() const { return drm_.get(); }
++
+   WaylandShm* shm() const { return shm_.get(); }
+ 
+   std::vector<gfx::BufferFormat> GetSupportedBufferFormats();
+@@ -188,6 +191,7 @@ class WaylandConnection : public PlatformEventSource,
+   std::unique_ptr<WaylandTouch> touch_;
+   std::unique_ptr<WaylandCursorPosition> wayland_cursor_position_;
+   std::unique_ptr<WaylandZwpLinuxDmabuf> zwp_dmabuf_;
++  std::unique_ptr<WaylandDrm> drm_;
+   std::unique_ptr<WaylandShm> shm_;
+   std::unique_ptr<WaylandBufferManagerHost> buffer_manager_host_;
+ 
+diff --git a/ui/ozone/platform/wayland/host/wayland_drm.cc b/ui/ozone/platform/wayland/host/wayland_drm.cc
+new file mode 100644
+index 000000000000..b00249a84086
+--- /dev/null
++++ b/ui/ozone/platform/wayland/host/wayland_drm.cc
+@@ -0,0 +1,152 @@
++// Copyright 2019 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <wayland-drm-client-protocol.h>
++
++#include <fcntl.h>
++#include <xf86drm.h>
++
++#include "base/files/scoped_file.h"
++#include "ui/gfx/buffer_format_util.h"
++#include "ui/ozone/common/linux/drm_util_linux.h"
++#include "ui/ozone/platform/wayland/host/wayland_connection.h"
++#include "ui/ozone/platform/wayland/host/wayland_drm.h"
++
++namespace ui {
++
++WaylandDrm::WaylandDrm(wl_drm* drm, WaylandConnection* connection)
++    : wl_drm_(drm), connection_(connection) {
++  static const wl_drm_listener drm_listener = {
++      &WaylandDrm::Device,
++      &WaylandDrm::Format,
++      &WaylandDrm::Authenticated,
++      &WaylandDrm::Capabilities,
++  };
++  wl_drm_add_listener(wl_drm_.get(), &drm_listener, this);
++  connection_->ScheduleFlush();
++
++  // A roundtrip after binding guarantees that the client has received all
++  // supported formats and capabilities of the device.
++  wl_display_roundtrip(connection_->display());
++}
++
++WaylandDrm::~WaylandDrm() = default;
++
++bool WaylandDrm::SupportsDrmPrime() const {
++  return authenticated_ && !!wl_drm_;
++}
++
++void WaylandDrm::CreateBuffer(base::ScopedFD fd,
++                              const gfx::Size& size,
++                              const std::vector<uint32_t>& strides,
++                              const std::vector<uint32_t>& offsets,
++                              const std::vector<uint64_t>& modifiers,
++                              uint32_t format,
++                              uint32_t planes_count,
++                              wl::OnRequestBufferCallback callback) {
++  // If the |planes_count| less than the maximum sizes of these arrays and the
++  // number of offsets and strides that |wl_drm| can receive, just initialize
++  // them to 0, which is totally ok.
++  uint32_t stride[3] = {0};
++  uint32_t offset[3] = {0};
++  for (size_t i = 0; i < planes_count; i++) {
++    stride[i] = strides[i];
++    offset[i] = offset[i];
++  }
++
++  wl::Object<wl_buffer> buffer(wl_drm_create_prime_buffer(
++      wl_drm_.get(), fd.get(), size.width(), size.height(), format, offset[0],
++      stride[0], offset[1], stride[1], offset[2], stride[2]));
++  connection_->ScheduleFlush();
++
++  std::move(callback).Run(std::move(buffer));
++}
++
++void WaylandDrm::HandleDrmFailure(const std::string& error) {
++  LOG(WARNING) << error;
++  wl_drm_.reset();
++}
++
++void WaylandDrm::AddSupportedFourCCFormat(uint32_t fourcc_format) {
++  // Return on unsupported fourcc formats.
++  if (!IsValidBufferFormat(fourcc_format))
++    return;
++
++  gfx::BufferFormat format = GetBufferFormatFromFourCCFormat(fourcc_format);
++  // Modifiers are not supported by the |wl_drm|, but for consistency with the
++  // WaylandZwpLinuxDmabuf we use the same map type, which is passed to the
++  // WaylandBufferManagerGpu later during initialization stage of the GPU
++  // process.
++  std::vector<uint64_t> modifiers;
++  supported_buffer_formats_.emplace(format, std::move(modifiers));
++}
++
++void WaylandDrm::Authenticate(const char* drm_device_path) {
++  if (!wl_drm_)
++    return;
++
++  DCHECK(drm_device_path);
++  base::ScopedFD drm_fd(open(drm_device_path, O_RDWR));
++  if (!drm_fd.is_valid()) {
++    HandleDrmFailure("Drm open failed: " + std::string(drm_device_path));
++    return;
++  }
++
++  drm_magic_t magic;
++  memset(&magic, 0, sizeof(magic));
++  if (drmGetMagic(drm_fd.get(), &magic)) {
++    HandleDrmFailure("Failed to get drm magic");
++    return;
++  }
++
++  wl_drm_authenticate(wl_drm_.get(), magic);
++  connection_->ScheduleFlush();
++
++  // This is the only way to wait until we get authenticated in Wayland. Happens
++  // only ones during initialization.
++  while (!authenticated_)
++    wl_display_roundtrip(connection_->display());
++}
++
++void WaylandDrm::DrmDeviceAuthenticated(struct wl_drm* wl_drm) {
++  DCHECK(wl_drm_ && wl_drm_.get() == wl_drm);
++  authenticated_ = true;
++}
++
++void WaylandDrm::HandleCapabilities(uint32_t value) {
++  if ((value & WL_DRM_CAPABILITY_PRIME) == 0)
++    HandleDrmFailure("Drm prime capability is not supported");
++}
++
++// static
++void WaylandDrm::Device(void* data, struct wl_drm* wl_drm, const char* path) {
++  auto* wayland_drm = static_cast<WaylandDrm*>(data);
++  DCHECK(wayland_drm && wayland_drm->wl_drm_.get() == wl_drm);
++  wayland_drm->Authenticate(path);
++}
++
++// static
++void WaylandDrm::Format(void* data, struct wl_drm* wl_drm, uint32_t format) {
++  auto* wayland_drm = static_cast<WaylandDrm*>(data);
++  DCHECK(wayland_drm && wayland_drm->wl_drm_.get() == wl_drm);
++  wayland_drm->AddSupportedFourCCFormat(format);
++}
++
++// static
++void WaylandDrm::Authenticated(void* data, struct wl_drm* wl_drm) {
++  auto* wayland_drm = static_cast<WaylandDrm*>(data);
++  DCHECK(wayland_drm);
++  wayland_drm->DrmDeviceAuthenticated(wl_drm);
++}
++
++// static
++void WaylandDrm::Capabilities(void* data,
++                              struct wl_drm* wl_drm,
++                              uint32_t value) {
++  auto* wayland_drm = static_cast<WaylandDrm*>(data);
++  DCHECK(wayland_drm && wayland_drm->wl_drm_.get() == wl_drm);
++  wayland_drm->HandleCapabilities(value);
++}
++
++}  // namespace ui
+diff --git a/ui/ozone/platform/wayland/host/wayland_drm.h b/ui/ozone/platform/wayland/host/wayland_drm.h
+new file mode 100644
+index 000000000000..bbccaae83516
+--- /dev/null
++++ b/ui/ozone/platform/wayland/host/wayland_drm.h
+@@ -0,0 +1,101 @@
++// Copyright 2019 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_OZONE_PLATFORM_WAYLAND_HOST_WAYLAND_DRM_H_
++#define UI_OZONE_PLATFORM_WAYLAND_HOST_WAYLAND_DRM_H_
++
++#include <wayland-drm-client-protocol.h>
++
++#include <vector>
++
++#include "base/containers/flat_map.h"
++#include "base/files/scoped_file.h"
++#include "base/macros.h"
++#include "ui/ozone/platform/wayland/common/wayland_object.h"
++#include "ui/ozone/platform/wayland/common/wayland_util.h"
++
++struct wl_drm;
++
++namespace gfx {
++enum class BufferFormat;
++class Size;
++}  // namespace gfx
++
++namespace ui {
++
++class WaylandConnection;
++
++// Wrapper around |wl_drm| Wayland factory, which creates
++// |wl_buffer|s backed by dmabuf prime file descriptor.
++class WaylandDrm {
++ public:
++  WaylandDrm(wl_drm* drm, WaylandConnection* connection);
++  ~WaylandDrm();
++
++  // Says if can create dmabuf based wl_buffers.
++  bool SupportsDrmPrime() const;
++
++  // Requests to create a wl_buffer backed by the dmabuf prime |fd| descriptor.
++  // The result is sent back via the |callback|. If buffer creation failed,
++  // nullptr is sent back via the callback. Otherwise, a pointer to the
++  // |wl_buffer| is sent.
++  void CreateBuffer(base::ScopedFD fd,
++                    const gfx::Size& size,
++                    const std::vector<uint32_t>& strides,
++                    const std::vector<uint32_t>& offsets,
++                    const std::vector<uint64_t>& modifiers,
++                    uint32_t format,
++                    uint32_t planes_count,
++                    wl::OnRequestBufferCallback callback);
++
++  // Returns supported buffer formats received from the Wayland compositor.
++  wl::BufferFormatsWithModifiersMap supported_buffer_formats() const {
++    return supported_buffer_formats_;
++  }
++
++ private:
++  // Resets the |wl_drm| and prints the error.
++  void HandleDrmFailure(const std::string& error);
++
++  // Receives supported |fourcc_format| from either ::Format call.
++  void AddSupportedFourCCFormat(uint32_t fourcc_format);
++
++  // Authenticates the drm device passed in the |drm_device_path|.
++  void Authenticate(const char* drm_device_path);
++
++  // Completes the drm device authentication.
++  void DrmDeviceAuthenticated(struct wl_drm* wl_drm);
++
++  // Checks the capabilities of the drm device.
++  void HandleCapabilities(uint32_t value);
++
++  // wl_drm_listener:
++  static void Device(void* data,
++                     struct wl_drm* wl_drm,
++                     const char* drm_device_path);
++  static void Format(void* data, struct wl_drm* wl_drm, uint32_t format);
++  static void Authenticated(void* data, struct wl_drm* wl_drm);
++  static void Capabilities(void* data, struct wl_drm* wl_drm, uint32_t value);
++
++  // Holds pointer to the wl_drm Wayland factory.
++  wl::Object<wl_drm> wl_drm_;
++
++  // Non-owned.
++  WaylandConnection* const connection_;
++
++  // Holds supported DRM formats translated to gfx::BufferFormat. Note that
++  // |wl_drm| neither announces modifiers nor allows to create buffers with
++  // modifiers. Thus, they are always empty.
++  wl::BufferFormatsWithModifiersMap supported_buffer_formats_;
++
++  // Says if the drm device passed by the Wayland compositor authenticates this
++  // client.
++  bool authenticated_ = false;
++
++  DISALLOW_COPY_AND_ASSIGN(WaylandDrm);
++};
++
++}  // namespace ui
++
++#endif  // UI_OZONE_PLATFORM_WAYLAND_HOST_WAYLAND_DRM_H_
+diff --git a/ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h b/ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h
+index 0716d862901f..80ae907342ab 100644
+--- a/ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h
++++ b/ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h
+@@ -26,7 +26,7 @@ namespace ui {
+ class WaylandConnection;
+ 
+ // Wrapper around |zwp_linux_dmabuf_v1| Wayland factory, which creates
+-// |wl_buffer|s backed by dmabuf |file| descriptor.
++// |wl_buffer|s backed by dmabuf prime file descriptor.
+ class WaylandZwpLinuxDmabuf {
+  public:
+   WaylandZwpLinuxDmabuf(zwp_linux_dmabuf_v1* zwp_linux_dmabuf,
+diff --git a/ui/ozone/platform/wayland/ozone_platform_wayland.cc b/ui/ozone/platform/wayland/ozone_platform_wayland.cc
+index d251f4495387..3d2eaa023309 100644
+--- a/ui/ozone/platform/wayland/ozone_platform_wayland.cc
++++ b/ui/ozone/platform/wayland/ozone_platform_wayland.cc
+@@ -21,6 +21,7 @@
+ #include "ui/ozone/platform/wayland/gpu/wayland_buffer_manager_gpu.h"
+ #include "ui/ozone/platform/wayland/gpu/wayland_surface_factory.h"
+ #include "ui/ozone/platform/wayland/host/wayland_buffer_manager_connector.h"
++#include "ui/ozone/platform/wayland/host/wayland_buffer_manager_host.h"
+ #include "ui/ozone/platform/wayland/host/wayland_connection.h"
+ #include "ui/ozone/platform/wayland/host/wayland_input_method_context_factory.h"
+ #include "ui/ozone/platform/wayland/host/wayland_output_manager.h"
+-- 
+2.23.0

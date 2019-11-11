@@ -917,7 +917,8 @@ CHROMIUM_CORE_GN_DEFINES=""
 CHROMIUM_CORE_GN_DEFINES+=' is_debug=false'
 
 # Wayland settings
-CHROMIUM_CORE_GN_DEFINES+=' use_ozone=true use_system_minigbm=true use_system_libdrm=true use_xkbcommon=true'
+CHROMIUM_CORE_GN_DEFINES+=' use_ozone=true ozone_auto_platforms=false ozone_platform_wayland=true'
+CHROMIUM_CORE_GN_DEFINES+=' use_system_libwayland=true use_system_minigbm=true use_system_libdrm=true use_xkbcommon=true'
 
 %ifarch x86_64 aarch64
 CHROMIUM_CORE_GN_DEFINES+=' system_libdir="lib64"'
